@@ -1,0 +1,150 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./gym_booking.db"
+}
+
+model Store {
+  id        Int      @id @default(autoincrement())
+  name      String
+  address   String
+  phone     String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  trainers    Trainer[]
+  schedules   Schedule[]
+  bookings    Booking[]
+}
+
+model Member {
+  id        Int      @id @default(autoincrement())
+  name      String
+  phone     String   @unique
+  gender    String?
+  birthday  DateTime?
+  notes     String?
+  createdAt DateTime @default(now())
+
+  packages      MemberPackage[]
+  bookings      Booking[]
+  noShows       NoShow[]
+  feedbacks     Feedback[]
+  notifications Notification[]
+}
+
+model Trainer {
+  id        Int      @id @default(autoincrement())
+  name      String
+  phone     String   @unique
+  specialties String?
+  isActive  Boolean  @default(true)
+  storeId   Int
+  createdAt DateTime @default(now())
+
+  store     Store      @relation(fields: [storeId], references: [id])
+  schedules Schedule[]
+  bookings  Booking[]
+  feedbacks Feedback[]
+}
+
+model CoursePackage {
+  id          Int    @id @default(autoincrement())
+  name        String
+  totalSlots  Int
+  priceCents  Int
+  description String?
+
+  memberPackages MemberPackage[]
+}
+
+model MemberPackage {
+  id          Int      @id @default(autoincrement())
+  memberId    Int
+  packageId   Int
+  remainSlots Int
+  boughtAt    DateTime @default(now())
+  expireAt    DateTime?
+
+  member   Member        @relation(fields: [memberId], references: [id])
+  package  CoursePackage @relation(fields: [packageId], references: [id])
+  bookings Booking[]
+}
+
+model Schedule {
+  id        Int      @id @default(autoincrement())
+  trainerId Int
+  storeId   Int
+  date      DateTime
+  startAt   String
+  endAt     String
+  isBooked  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  trainer Trainer @relation(fields: [trainerId], references: [id])
+  store   Store   @relation(fields: [storeId], references: [id])
+  booking Booking?
+}
+
+model Booking {
+  id              Int      @id @default(autoincrement())
+  memberId        Int
+  trainerId       Int
+  storeId         Int
+  scheduleId      Int      @unique
+  memberPackageId Int
+  status          String   @default("booked")
+  checkedInAt     DateTime?
+  cancelledAt     DateTime?
+  cancelReason    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  member       Member        @relation(fields: [memberId], references: [id])
+  trainer      Trainer       @relation(fields: [trainerId], references: [id])
+  store        Store         @relation(fields: [storeId], references: [id])
+  schedule     Schedule      @relation(fields: [scheduleId], references: [id])
+  memberPackage MemberPackage @relation(fields: [memberPackageId], references: [id])
+  noShow       NoShow?
+  feedback     Feedback?
+}
+
+model NoShow {
+  id        Int      @id @default(autoincrement())
+  bookingId Int      @unique
+  memberId  Int
+  reason    String?
+  createdAt DateTime @default(now())
+
+  booking Booking @relation(fields: [bookingId], references: [id])
+  member  Member  @relation(fields: [memberId], references: [id])
+}
+
+model Feedback {
+  id          Int      @id @default(autoincrement())
+  bookingId   Int      @unique
+  trainerId   Int
+  memberId    Int
+  rating      Int
+  content     String?
+  createdAt   DateTime @default(now())
+
+  booking Booking @relation(fields: [bookingId], references: [id])
+  trainer Trainer @relation(fields: [trainerId], references: [id])
+  member  Member  @relation(fields: [memberId], references: [id])
+}
+
+model Notification {
+  id        Int      @id @default(autoincrement())
+  memberId  Int
+  type      String
+  title     String
+  content   String
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  member Member @relation(fields: [memberId], references: [id])
+}
