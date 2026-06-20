@@ -54,6 +54,76 @@ router.get('/trainer/:trainerId', async (req: Request, res: Response) => {
   res.json({ data: schedules })
 })
 
+router.get('/trainer/:trainerId/daily', async (req: Request, res: Response) => {
+  const trainerId = Number(req.params.trainerId)
+  const date = req.query.date as string
+  const targetDate = date ? dayjs(date) : dayjs()
+  const dayStart = targetDate.startOf('day').toDate()
+  const dayEnd = targetDate.endOf('day').toDate()
+
+  const trainer = await prisma.trainer.findUnique({ where: { id: trainerId } })
+  if (!trainer) return res.status(404).json({ error: '教练不存在' })
+
+  const bookings = await prisma.booking.findMany({
+    where: {
+      trainerId,
+      schedule: { date: { gte: dayStart, lte: dayEnd } },
+    },
+    include: {
+      member: true,
+      store: true,
+      schedule: true,
+      feedback: true,
+    },
+    orderBy: [{ schedule: { startAt: 'asc' } }],
+  })
+
+  const grouped: Record<string, any[]> = {
+    booked: [],
+    checked_in: [],
+    completed: [],
+    no_show: [],
+    cancelled: [],
+  }
+  for (const b of bookings) {
+    grouped[b.status]?.push({
+      bookingId: b.id,
+      memberId: b.memberId,
+      memberName: b.member.name,
+      memberPhone: b.member.phone,
+      date: b.schedule.date,
+      startAt: b.schedule.startAt,
+      endAt: b.schedule.endAt,
+      storeName: b.store.name,
+      status: b.status,
+      checkedInAt: b.checkedInAt,
+      hasFeedback: !!b.feedback,
+      feedbackRating: b.feedback?.rating,
+      feedbackContent: b.feedback?.content,
+    })
+  }
+
+  const total = bookings.length
+  const completed = grouped.completed.length + grouped.checked_in.length
+
+  res.json({
+    data: {
+      date: targetDate.format('YYYY-MM-DD'),
+      trainer: { id: trainer.id, name: trainer.name, specialties: trainer.specialties },
+      summary: {
+        totalCount: total,
+        bookedCount: grouped.booked.length,
+        checkedInCount: grouped.checked_in.length,
+        completedCount: grouped.completed.length,
+        noShowCount: grouped.no_show.length,
+        cancelledCount: grouped.cancelled.length,
+        attendanceRate: total > 0 ? Math.round(((completed) / total) * 100) : 0,
+      },
+      groupedBookings: grouped,
+    },
+  })
+})
+
 router.post('/', async (req: Request, res: Response) => {
   const { trainerId, storeId, date, startAt, endAt } = req.body
   if (!trainerId || !storeId || !date || !startAt || !endAt)

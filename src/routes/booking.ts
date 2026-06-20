@@ -70,6 +70,22 @@ router.put('/:id/reschedule', async (req: Request, res: Response) => {
   if (!newSchedule) return res.status(404).json({ error: '新时段不存在' })
   if (newSchedule.isBooked) return res.status(409).json({ error: '新时段已被预约' })
 
+  const conflict = await prisma.booking.findFirst({
+    where: {
+      memberId: booking.memberId,
+      id: { not: id },
+      status: { in: ['booked', 'checked_in'] },
+      schedule: { date: newSchedule.date, startAt: newSchedule.startAt },
+    },
+    include: { schedule: true },
+  })
+  if (conflict) {
+    return res.status(409).json({
+      error: `该会员在 ${conflict.schedule.startAt} 时段已有预约，无法改期到同一时段`,
+      conflictBookingId: conflict.id,
+    })
+  }
+
   const updated = await prisma.$transaction(async (tx) => {
     await tx.schedule.update({ where: { id: booking.scheduleId }, data: { isBooked: false } })
     await tx.schedule.update({ where: { id: newScheduleId }, data: { isBooked: true } })
@@ -161,6 +177,41 @@ router.put('/:id/complete', async (req: Request, res: Response) => {
   })
 
   res.json({ data: updated })
+})
+
+router.put('/:id/complete-with-feedback', async (req: Request, res: Response) => {
+  const id = Number(req.params.id)
+  const { rating, content } = req.body
+  if (rating === undefined) return res.status(400).json({ error: 'rating 为必填' })
+  if (rating < 1 || rating > 5) return res.status(400).json({ error: '评分范围 1-5' })
+
+  const booking = await prisma.booking.findUnique({ where: { id } })
+  if (!booking) return res.status(404).json({ error: '预约不存在' })
+  if (booking.status !== 'booked' && booking.status !== 'checked_in')
+    return res.status(400).json({ error: '仅已预约/已签到状态可提交上课结果' })
+
+  const existingFeedback = await prisma.feedback.findUnique({ where: { bookingId: id } })
+  if (existingFeedback) return res.status(409).json({ error: '该课程已提交反馈' })
+
+  const result = await prisma.$transaction(async (tx) => {
+    const updatedBooking = await tx.booking.update({
+      where: { id },
+      data: { status: 'completed' },
+      include: { member: true, trainer: true, schedule: true, store: true },
+    })
+    const feedback = await tx.feedback.create({
+      data: {
+        bookingId: id,
+        trainerId: booking.trainerId,
+        memberId: booking.memberId,
+        rating,
+        content: content || null,
+      },
+    })
+    return { booking: updatedBooking, feedback }
+  })
+
+  res.json({ data: result })
 })
 
 router.put('/:id/noshow', async (req: Request, res: Response) => {
