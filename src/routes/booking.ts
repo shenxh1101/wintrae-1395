@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express'
 import { prisma } from '../lib/prisma'
 import dayjs from 'dayjs'
+import { promoteNextWaitlist } from '../lib/waitlist'
 
 const router = Router()
 
@@ -136,7 +137,7 @@ router.put('/:id/cancel', async (req: Request, res: Response) => {
     },
   })
 
-  const promoted = await tryPromoteWaitlist(booking.scheduleId)
+  const promoted = await promoteNextWaitlist(booking.scheduleId)
   if (promoted) {
     console.log(`预约取消，候补会员 ${promoted.memberId} 进入待确认，候补ID=${promoted.waitlistId}`)
   }
@@ -260,83 +261,6 @@ router.get('/member/:memberId', async (req: Request, res: Response) => {
   })
   res.json({ data: bookings })
 })
-
-async function tryPromoteWaitlist(scheduleId: number): Promise<{ memberId: number; waitlistId: number } | null> {
-  const schedule = await prisma.schedule.findUnique({ where: { id: scheduleId }, include: { trainer: true } })
-  if (!schedule || schedule.isBooked) return null
-
-  const currentPending = await prisma.waitlist.findFirst({
-    where: { scheduleId, status: 'pending_confirm' },
-  })
-  if (currentPending) return null
-
-  const waitingList = await prisma.waitlist.findMany({
-    where: { scheduleId, status: 'waiting' },
-    include: { memberPackage: true, member: true },
-    orderBy: { priority: 'asc' },
-  })
-
-  const now = new Date()
-
-  for (const w of waitingList) {
-    const mp = w.memberPackage
-
-    if (mp.remainSlots <= 0) {
-      await prisma.waitlist.update({ where: { id: w.id }, data: { status: 'invalid' } })
-      continue
-    }
-    if (mp.expireAt && mp.expireAt < schedule.date) {
-      await prisma.waitlist.update({ where: { id: w.id }, data: { status: 'invalid' } })
-      continue
-    }
-    if (mp.expireAt && mp.expireAt < now) {
-      await prisma.waitlist.update({ where: { id: w.id }, data: { status: 'invalid' } })
-      continue
-    }
-
-    const conflict = await prisma.booking.findFirst({
-      where: {
-        memberId: w.memberId,
-        status: { in: ['booked', 'checked_in'] },
-        schedule: { date: schedule.date, startAt: schedule.startAt },
-      },
-    })
-    if (conflict) {
-      await prisma.waitlist.update({ where: { id: w.id }, data: { status: 'invalid' } })
-      continue
-    }
-
-    const confirmWindowMinutes = 30
-    const expireAt = dayjs().add(confirmWindowMinutes, 'minute').toDate()
-
-    await prisma.$transaction(async (tx) => {
-      await tx.waitlist.update({
-        where: { id: w.id },
-        data: { status: 'pending_confirm', confirmExpireAt: expireAt, priority: 0 },
-      })
-      const rest = await tx.waitlist.findMany({
-        where: { scheduleId, status: 'waiting', priority: { gt: w.priority } },
-        orderBy: { priority: 'asc' },
-      })
-      for (const r of rest) {
-        await tx.waitlist.update({ where: { id: r.id }, data: { priority: { decrement: 1 } } })
-      }
-    })
-
-    await prisma.notification.create({
-      data: {
-        memberId: w.memberId,
-        type: 'waitlist_promoted',
-        title: '候补待确认',
-        content: `您候补的 ${dayjs(schedule.date).format('MM-DD')} ${schedule.startAt}-${schedule.endAt} ${schedule.trainer.name} 教练课程有名额了！请在 ${confirmWindowMinutes} 分钟内确认，超时将让给其他候补会员`,
-      },
-    })
-
-    return { memberId: w.memberId, waitlistId: w.id }
-  }
-
-  return null
-}
 
 router.post('/batch/noshow', async (req: Request, res: Response) => {
   const { bookingIds, reason, date, trainerId } = req.body as { bookingIds: number[]; reason?: string; date?: string; trainerId?: number }

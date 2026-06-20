@@ -193,12 +193,48 @@ router.get('/trainer/:trainerId/weekly', async (req: Request, res: Response) => 
 
   const todayKey = dayjs().format('YYYY-MM-DD')
   const todayBookings = days[todayKey]?.bookings || []
-  const pendingToday = todayBookings.filter((b: any) => b.status === 'booked')
+  const todayFullBookings = bookings.filter(b => dayjs(b.schedule.date).format('YYYY-MM-DD') === todayKey)
+
+  const toRemind: any[] = []
+  const toMarkNoShow: any[] = []
+  const checkedInAwaitingFeedback: any[] = []
+  const now = dayjs()
+
+  for (const b of todayFullBookings) {
+    const item = {
+      bookingId: b.id,
+      memberId: b.memberId,
+      memberName: b.member.name,
+      memberPhone: b.member.phone,
+      startAt: b.schedule.startAt,
+      endAt: b.schedule.endAt,
+      status: b.status,
+      storeName: b.store.name,
+      storeId: b.storeId,
+      hasFeedback: !!b.feedback,
+      checkedInAt: b.checkedInAt,
+      hoursUntilStart: Math.round(dayjs(b.schedule.date).hour(Number(b.schedule.startAt.split(':')[0])).diff(now, 'minute') / 60 * 10) / 10,
+    }
+
+    if (b.status === 'booked') {
+      if (item.hoursUntilStart <= -1) {
+        toMarkNoShow.push(item)
+      } else {
+        toRemind.push(item)
+      }
+    } else if (b.status === 'checked_in') {
+      checkedInAwaitingFeedback.push({ ...item, hasFeedback: !!b.feedback, feedbackId: b.feedback?.id || null })
+    }
+  }
+
+  toRemind.sort((a, b) => a.hoursUntilStart - b.hoursUntilStart)
+  toMarkNoShow.sort((a, b) => a.hoursUntilStart - b.hoursUntilStart)
 
   res.json({
     data: {
       weekStart: start.format('YYYY-MM-DD'),
       weekEnd: end.format('YYYY-MM-DD'),
+      today: todayKey,
       trainer: { id: trainer.id, name: trainer.name, specialties: trainer.specialties },
       summary: {
         totalBookings,
@@ -212,7 +248,22 @@ router.get('/trainer/:trainerId/weekly', async (req: Request, res: Response) => 
         completionRate: totalBookings > 0 ? Math.round((completedCount / totalBookings) * 100) : 0,
         feedbackCount: feedbacks.length,
         avgRating: Math.round(avgRating * 10) / 10,
-        pendingTodayCount: pendingToday.length,
+      },
+      todayActionZone: {
+        date: todayKey,
+        isWithinWeek: !!days[todayKey],
+        counts: {
+          toRemind: toRemind.length,
+          toMarkNoShow: toMarkNoShow.length,
+          checkedInAwaitingFeedback: checkedInAwaitingFeedback.length,
+          totalActionable: toRemind.length + toMarkNoShow.length + checkedInAwaitingFeedback.length,
+        },
+        toRemindIds: toRemind.map(b => b.bookingId),
+        toMarkNoShowIds: toMarkNoShow.map(b => b.bookingId),
+        checkedInAwaitingFeedbackIds: checkedInAwaitingFeedback.map(b => b.bookingId),
+        toRemind,
+        toMarkNoShow,
+        checkedInAwaitingFeedback,
       },
       daily: Object.values(days),
     },

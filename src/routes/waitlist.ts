@@ -1,10 +1,9 @@
 import { Router, Request, Response } from 'express'
 import { prisma } from '../lib/prisma'
 import dayjs from 'dayjs'
+import { promoteNextWaitlist, CONFIRM_WINDOW_MINUTES } from '../lib/waitlist'
 
 const router = Router()
-
-const DEFAULT_CONFIRM_WINDOW_MINUTES = 30
 
 router.post('/', async (req: Request, res: Response) => {
   const { memberId, scheduleId, memberPackageId } = req.body
@@ -87,30 +86,67 @@ router.post('/:id/confirm', async (req: Request, res: Response) => {
 
   if (waitlist.status === 'promoted') return res.status(400).json({ error: '该候补已完成补位' })
   if (waitlist.status === 'expired') return res.status(400).json({ error: '确认超时，候补名额已失效' })
+  if (waitlist.status === 'rejected') return res.status(400).json({ error: '该候补已放弃' })
   if (waitlist.status === 'cancelled') return res.status(400).json({ error: '该候补已取消' })
   if (waitlist.status === 'waiting') return res.status(400).json({ error: '尚未轮到您，请等待补位通知' })
   if (waitlist.status !== 'pending_confirm') return res.status(400).json({ error: `当前状态(${waitlist.status})不可确认` })
 
   const now = new Date()
   if (waitlist.confirmExpireAt && waitlist.confirmExpireAt < now) {
-    await prisma.waitlist.update({ where: { id }, data: { status: 'expired' } })
-    return res.status(410).json({ error: '确认已超时，请重新候补' })
+    await prisma.waitlist.update({ where: { id }, data: { status: 'expired', confirmExpireAt: null } })
+    const promoted = await promoteNextWaitlist(waitlist.scheduleId)
+    return res.status(410).json({
+      error: '确认已超时，请重新候补',
+      promotedNext: !!promoted,
+      nextMemberId: promoted?.memberId ?? null,
+    })
   }
 
+  const mp = waitlist.memberPackage
   const schedule = waitlist.schedule
-  const existingBooking = await prisma.booking.findFirst({
+  const validationErrors: string[] = []
+
+  if (mp.remainSlots <= 0) validationErrors.push('课程包课时已用完')
+  if (mp.expireAt && mp.expireAt < now) validationErrors.push('课程包已过期')
+  if (mp.expireAt && mp.expireAt < schedule.date) validationErrors.push('课程包在课程日期前已过期')
+
+  const conflict = await prisma.booking.findFirst({
+    where: {
+      memberId: waitlist.memberId,
+      status: { in: ['booked', 'checked_in'] },
+      schedule: { date: schedule.date, startAt: schedule.startAt },
+    },
+  })
+  if (conflict) validationErrors.push('您在同一时段已有有效预约')
+
+  if (validationErrors.length > 0) {
+    await prisma.waitlist.update({ where: { id }, data: { status: 'invalid', confirmExpireAt: null } })
+    const promoted = await promoteNextWaitlist(waitlist.scheduleId)
+    return res.status(409).json({
+      error: validationErrors.join('；'),
+      promotedNext: !!promoted,
+      nextMemberId: promoted?.memberId ?? null,
+    })
+  }
+
+  const existingBookingSameSlot = await prisma.booking.findFirst({
     where: { scheduleId: schedule.id, status: { in: ['booked', 'checked_in'] } },
   })
-  if (existingBooking) {
+  if (existingBookingSameSlot) {
     await prisma.waitlist.update({ where: { id }, data: { status: 'waiting', confirmExpireAt: null, priority: (await prisma.waitlist.count({ where: { scheduleId: schedule.id, status: 'waiting' } })) + 1 } })
     return res.status(409).json({ error: '名额已被占用，已退回等待队列' })
   }
 
   const result = await prisma.$transaction(async (tx) => {
-    await tx.memberPackage.update({
-      where: { id: waitlist.memberPackageId },
+    const freshMp = await tx.memberPackage.findUnique({ where: { id: mp.id } })
+    if (!freshMp || freshMp.remainSlots <= 0) throw new Error('课时余量不足，已被其他操作占用')
+
+    const updatedMp = await tx.memberPackage.update({
+      where: { id: mp.id },
       data: { remainSlots: { decrement: 1 } },
     })
+    if (updatedMp.remainSlots < 0) throw new Error('课时余量不足，扣减失败')
+
     await tx.schedule.update({ where: { id: schedule.id }, data: { isBooked: true } })
     const booking = await tx.booking.create({
       data: {
@@ -118,12 +154,12 @@ router.post('/:id/confirm', async (req: Request, res: Response) => {
         trainerId: schedule.trainerId,
         storeId: schedule.storeId,
         scheduleId: schedule.id,
-        memberPackageId: waitlist.memberPackageId,
+        memberPackageId: mp.id,
         status: 'booked',
       },
       include: { member: true, trainer: true, schedule: true, store: true },
     })
-    await tx.waitlist.update({ where: { id }, data: { status: 'promoted' } })
+    await tx.waitlist.update({ where: { id }, data: { status: 'promoted', confirmExpireAt: null } })
     await tx.notification.create({
       data: {
         memberId: waitlist.memberId,
@@ -151,6 +187,7 @@ router.post('/:id/confirm', async (req: Request, res: Response) => {
         storeName: result.store.name,
       },
       waitlistId: id,
+      remainSlots: (await prisma.memberPackage.findUnique({ where: { id: mp.id } }))?.remainSlots ?? 0,
     },
   })
 })
@@ -176,7 +213,17 @@ router.post('/:id/reject', async (req: Request, res: Response) => {
     },
   })
 
-  res.json({ data: { success: true, message: '已放弃候补名额' } })
+  const promoted = await promoteNextWaitlist(waitlist.scheduleId)
+
+  res.json({
+    data: {
+      success: true,
+      message: '已放弃候补名额',
+      promotedNext: !!promoted,
+      nextMemberId: promoted?.memberId ?? null,
+      scheduleNowAvailable: !promoted,
+    },
+  })
 })
 
 router.delete('/:id', async (req: Request, res: Response) => {
@@ -187,15 +234,12 @@ router.delete('/:id', async (req: Request, res: Response) => {
 
   await prisma.waitlist.update({ where: { id }, data: { status: 'cancelled' } })
 
-  const schedule = await prisma.schedule.findUnique({ where: { id: waitlist.scheduleId } })
-  if (schedule) {
-    const remaining = await prisma.waitlist.findMany({
-      where: { scheduleId: schedule.id, status: 'waiting', id: { gt: id } },
-      orderBy: { priority: 'asc' },
-    })
-    for (const w of remaining) {
-      await prisma.waitlist.update({ where: { id: w.id }, data: { priority: { decrement: 1 } } })
-    }
+  const remaining = await prisma.waitlist.findMany({
+    where: { scheduleId: waitlist.scheduleId, status: 'waiting', priority: { gt: waitlist.priority } },
+    orderBy: { priority: 'asc' },
+  })
+  for (const w of remaining) {
+    await prisma.waitlist.update({ where: { id: w.id }, data: { priority: { decrement: 1 } } })
   }
 
   res.json({ message: '已取消候补' })
@@ -203,6 +247,14 @@ router.delete('/:id', async (req: Request, res: Response) => {
 
 router.get('/schedule/:scheduleId', async (req: Request, res: Response) => {
   const scheduleId = Number(req.params.scheduleId)
+
+  const schedule = await prisma.schedule.findUnique({
+    where: { id: scheduleId },
+    include: { trainer: true, store: true, bookings: { where: { status: { in: ['booked', 'checked_in'] } }, take: 1 } },
+  })
+  if (!schedule) return res.status(404).json({ error: '时段不存在' })
+
+  const hasActiveBooking = schedule.bookings.length > 0
   const waitlist = await prisma.waitlist.findMany({
     where: { scheduleId, status: { in: ['waiting', 'pending_confirm'] } },
     include: { member: true },
@@ -214,12 +266,43 @@ router.get('/schedule/:scheduleId', async (req: Request, res: Response) => {
 
   res.json({
     data: {
+      scheduleId,
+      date: schedule.date,
+      startAt: schedule.startAt,
+      endAt: schedule.endAt,
+      trainerName: schedule.trainer.name,
+      storeName: schedule.store.name,
+      hasActiveBooking,
+      currentTurn: pendingConfirm ? {
+        type: 'pending_confirm',
+        waitlistId: pendingConfirm.id,
+        memberId: pendingConfirm.memberId,
+        memberName: pendingConfirm.member.name,
+        memberPhone: pendingConfirm.member.phone,
+        confirmExpireAt: pendingConfirm.confirmExpireAt,
+        remainMinutes: pendingConfirm.confirmExpireAt
+          ? Math.max(0, Math.ceil((pendingConfirm.confirmExpireAt.getTime() - Date.now()) / 60000))
+          : 0,
+      } : waiting.length > 0 ? {
+        type: 'waiting_top',
+        waitlistId: waiting[0].id,
+        memberId: waiting[0].memberId,
+        memberName: waiting[0].member.name,
+        memberPhone: waiting[0].member.phone,
+      } : hasActiveBooking ? {
+        type: 'booked_no_waitlist',
+      } : {
+        type: 'available',
+      },
       pendingConfirm: pendingConfirm ? {
         id: pendingConfirm.id,
         memberId: pendingConfirm.memberId,
         memberName: pendingConfirm.member.name,
         memberPhone: pendingConfirm.member.phone,
         confirmExpireAt: pendingConfirm.confirmExpireAt,
+        remainMinutes: pendingConfirm.confirmExpireAt
+          ? Math.max(0, Math.ceil((pendingConfirm.confirmExpireAt.getTime() - Date.now()) / 60000))
+          : 0,
         joinedAt: pendingConfirm.createdAt,
       } : null,
       waiting: waiting.map((w, i) => ({
@@ -230,6 +313,8 @@ router.get('/schedule/:scheduleId', async (req: Request, res: Response) => {
         memberPhone: w.member.phone,
         joinedAt: w.createdAt,
       })),
+      totalWaiting: waiting.length,
+      available: !hasActiveBooking && !pendingConfirm && waiting.length === 0,
     },
   })
 })
@@ -244,9 +329,39 @@ router.get('/member/:memberId', async (req: Request, res: Response) => {
 
   const result = await Promise.all(
     waitlist.map(async (w) => {
-      const position = w.status === 'waiting' ? await prisma.waitlist.count({
-        where: { scheduleId: w.scheduleId, status: 'waiting', priority: { lt: w.priority } },
-      }) + 1 : 0
+      let position = 0
+      let totalWaiting = 0
+      let currentTurn: any = null
+
+      if (w.status === 'waiting') {
+        const ahead = await prisma.waitlist.count({
+          where: { scheduleId: w.scheduleId, status: 'waiting', priority: { lt: w.priority } },
+        })
+        position = ahead + 1
+        totalWaiting = await prisma.waitlist.count({
+          where: { scheduleId: w.scheduleId, status: 'waiting' },
+        })
+        if (position === 1) {
+          const pending = await prisma.waitlist.findFirst({
+            where: { scheduleId: w.scheduleId, status: 'pending_confirm' },
+            include: { member: true },
+          })
+          if (!pending) {
+            currentTurn = { type: 'next_up', message: '下一位就是您' }
+          } else {
+            currentTurn = {
+              type: 'pending_other',
+              message: `正在确认中：${pending.member.name}`,
+              remainMinutes: pending.confirmExpireAt
+                ? Math.max(0, Math.ceil((pending.confirmExpireAt.getTime() - Date.now()) / 60000))
+                : 0,
+            }
+          }
+        }
+      } else if (w.status === 'pending_confirm') {
+        currentTurn = { type: 'your_turn', message: '轮到您确认了！' }
+      }
+
       return {
         id: w.id,
         scheduleId: w.scheduleId,
@@ -256,14 +371,22 @@ router.get('/member/:memberId', async (req: Request, res: Response) => {
         trainerName: w.schedule.trainer.name,
         storeName: w.schedule.store.name,
         position,
+        totalWaiting,
         status: w.status,
         confirmExpireAt: w.confirmExpireAt,
+        remainMinutes: w.confirmExpireAt
+          ? Math.max(0, Math.ceil((w.confirmExpireAt.getTime() - Date.now()) / 60000))
+          : 0,
+        currentTurn,
         joinedAt: w.createdAt,
       }
     })
   )
 
-  res.json({ data: result })
+  res.json({
+    data: result,
+    meta: { confirmWindowMinutes: CONFIRM_WINDOW_MINUTES },
+  })
 })
 
 export default router

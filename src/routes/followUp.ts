@@ -133,7 +133,7 @@ async function computeMemberRisks(members: any[], options: {
 }
 
 router.get('/risk-overview', async (req: Request, res: Response) => {
-  const { storeId, keyword, riskType, handler, status, startDate, endDate, lowSlotThreshold, cancelThreshold, noShowThreshold, urgentHours } = req.query as Record<string, string>
+  const { storeId, keyword, riskType, handler, followUpStatus, startDate, endDate, lowSlotThreshold, cancelThreshold, noShowThreshold, urgentHours } = req.query as Record<string, string>
   const periodStart = startDate ? dayjs(startDate).startOf('day') : dayjs().subtract(30, 'day').startOf('day')
   const periodEnd = endDate ? dayjs(endDate).endOf('day') : dayjs().endOf('day')
 
@@ -141,12 +141,9 @@ router.get('/risk-overview', async (req: Request, res: Response) => {
     ? { OR: [{ name: { contains: keyword } }, { phone: { contains: keyword } }] }
     : {}
 
-  if (handler || status) {
+  if (handler) {
     whereMember.followUps = {
-      some: {
-        ...(handler ? { handler: { contains: handler } } : {}),
-        ...(status ? { status } : {}),
-      },
+      some: { handler: { contains: handler } },
     }
   }
 
@@ -157,7 +154,7 @@ router.get('/risk-overview', async (req: Request, res: Response) => {
       bookings: {
         include: { schedule: true, noShow: true },
       },
-      followUps: { orderBy: { createdAt: 'desc' }, take: 1 },
+      followUps: { orderBy: { createdAt: 'desc' }, take: 10 },
     },
     orderBy: { id: 'asc' },
   })
@@ -172,14 +169,103 @@ router.get('/risk-overview', async (req: Request, res: Response) => {
     urgentHours: urgentHours ? Number(urgentHours) : undefined,
   })
 
+  const validFollowUpStatuses = ['pending', 'processing', 'covered_still_at_risk']
+
+  for (const r of memberRisks) {
+    const member = members.find((m: any) => m.id === r.memberId)
+    const followUps = member?.followUps || []
+
+    const latest = followUps[0] || null
+    const allCoveredRisks = new Set<string>()
+    for (const f of followUps) {
+      if (f.coveredRisks) {
+        try {
+          const arr = JSON.parse(f.coveredRisks)
+          for (const risk of arr) allCoveredRisks.add(risk)
+        } catch { /* ignore parse errors */ }
+      }
+    }
+
+    const activeRisks = r.riskTypes as string[]
+    const everyRiskCovered = activeRisks.every((risk: string) => allCoveredRisks.has(risk))
+    const hasUnresolvedRisk = activeRisks.length > 0
+
+    let computedStatus: 'pending' | 'processing' | 'covered_still_at_risk' | 'resolved'
+    let resolvedNote: string | null = null
+
+    if (latest && latest.status === 'processing') {
+      computedStatus = 'processing'
+    } else if (latest && latest.status === 'resolved' && everyRiskCovered && hasUnresolvedRisk) {
+      computedStatus = 'covered_still_at_risk'
+      const uncovered = activeRisks.filter(risk => !allCoveredRisks.has(risk))
+      if (uncovered.length > 0) {
+        resolvedNote = `风险已被标注为处理完成，但仍有${uncovered.length}项风险存在：${uncovered.join('、')}`
+      } else {
+        resolvedNote = '风险已被标注为处理完成，但当前数据中风险指标仍未消除'
+      }
+    } else if (latest && (latest.status === 'resolved' || latest.status === 'ignored')) {
+      if (!hasUnresolvedRisk) {
+        computedStatus = 'resolved'
+      } else if (everyRiskCovered) {
+        computedStatus = 'covered_still_at_risk'
+        resolvedNote = '跟进已完成但风险指标仍存在'
+      } else {
+        computedStatus = 'covered_still_at_risk'
+        resolvedNote = '部分风险未被覆盖'
+      }
+    } else if (latest && latest.status === 'pending') {
+      computedStatus = 'pending'
+    } else {
+      computedStatus = 'pending'
+    }
+
+    r.followUpStatus = computedStatus
+    r.followUpStatusLabel = {
+      pending: '待跟进',
+      processing: '处理中',
+      covered_still_at_risk: '已覆盖但风险仍存在',
+      resolved: '已处理完成',
+    }[computedStatus] || '待跟进'
+    r.followUpStatusNote = resolvedNote
+    r.latestFollowUp = latest ? {
+      id: latest.id,
+      status: latest.status,
+      handler: latest.handler,
+      followType: latest.followType,
+      coveredRisks: latest.coveredRisks ? (() => { try { return JSON.parse(latest.coveredRisks) } catch { return [] } })() : [],
+      remark: latest.remark,
+      createdAt: latest.createdAt,
+    } : null
+    r.coveredRisks = [...allCoveredRisks]
+    r.uncoveredRisks = activeRisks.filter((risk: string) => !allCoveredRisks.has(risk))
+    r.stillAtRiskAfterCovered = computedStatus === 'covered_still_at_risk'
+      ? activeRisks.filter((risk: string) => allCoveredRisks.has(risk))
+      : []
+  }
+
   if (riskType) {
     memberRisks = memberRisks.filter((r: any) => r.riskTypes.includes(riskType))
   }
-
+  if (followUpStatus && validFollowUpStatuses.includes(followUpStatus)) {
+    memberRisks = memberRisks.filter((r: any) => r.followUpStatus === followUpStatus)
+  }
   if (storeId) {
     memberRisks = memberRisks.filter((r: any) =>
       r.riskTypes.includes('low_slot') || r.riskTypes.includes('expiring_soon') || r.storeIds.includes(Number(storeId))
     )
+  }
+
+  const byHandler: Record<string, number> = {}
+  const byFollowUpStatus: Record<string, number> = {
+    pending: 0,
+    processing: 0,
+    covered_still_at_risk: 0,
+  }
+  for (const r of memberRisks) {
+    byFollowUpStatus[r.followUpStatus] = (byFollowUpStatus[r.followUpStatus] || 0) + 1
+    if (r.latestFollowUp?.handler) {
+      byHandler[r.latestFollowUp.handler] = (byHandler[r.latestFollowUp.handler] || 0) + 1
+    }
   }
 
   res.json({
@@ -188,19 +274,26 @@ router.get('/risk-overview', async (req: Request, res: Response) => {
       storeId: storeId ? Number(storeId) : null,
       riskType: riskType || null,
       handler: handler || null,
-      status: status || null,
+      followUpStatus: followUpStatus || null,
+      followUpStatusOptions: [
+        { value: 'pending', label: '待跟进' },
+        { value: 'processing', label: '处理中' },
+        { value: 'covered_still_at_risk', label: '已覆盖但风险仍存在' },
+      ],
       periodStart: periodStart.toDate(),
       periodEnd: periodEnd.toDate(),
     },
     summary: {
       totalAtRisk: memberRisks.length,
+      byFollowUpStatus,
       lowSlotCount: memberRisks.filter((r: any) => r.riskTypes.includes('low_slot')).length,
       expiringSoonCount: memberRisks.filter((r: any) => r.riskTypes.includes('expiring_soon')).length,
       frequentCancelCount: memberRisks.filter((r: any) => r.riskTypes.includes('frequent_cancel')).length,
       frequentNoShowCount: memberRisks.filter((r: any) => r.riskTypes.includes('frequent_noshow')).length,
       pendingUnconfirmedCount: memberRisks.filter((r: any) => r.riskTypes.includes('pending_unconfirmed')).length,
       multiRiskCount: memberRisks.filter((r: any) => r.riskCount >= 2).length,
-      byHandler: {} as Record<string, number>,
+      coveredButStillAtRiskCount: memberRisks.filter((r: any) => r.followUpStatus === 'covered_still_at_risk').length,
+      byHandler,
     },
   })
 })
