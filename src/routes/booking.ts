@@ -135,7 +135,12 @@ router.put('/:id/cancel', async (req: Request, res: Response) => {
     },
   })
 
-  res.json({ data: updated })
+  const promoted = await tryPromoteWaitlist(booking.scheduleId)
+  if (promoted) {
+    console.log(`预约取消，候补会员 ${promoted.memberId} 自动补位成功，预约ID=${promoted.bookingId}`)
+  }
+
+  res.json({ data: updated, promotedWaitlist: !!promoted })
 })
 
 router.put('/:id/checkin', async (req: Request, res: Response) => {
@@ -253,6 +258,179 @@ router.get('/member/:memberId', async (req: Request, res: Response) => {
     orderBy: { createdAt: 'desc' },
   })
   res.json({ data: bookings })
+})
+
+async function tryPromoteWaitlist(scheduleId: number): Promise<{ memberId: number; bookingId: number } | null> {
+  const schedule = await prisma.schedule.findUnique({ where: { id: scheduleId } })
+  if (!schedule || schedule.isBooked) return null
+
+  const waitingList = await prisma.waitlist.findMany({
+    where: { scheduleId, status: 'waiting' },
+    include: { memberPackage: true, member: true },
+    orderBy: { priority: 'asc' },
+  })
+
+  for (const w of waitingList) {
+    const mp = w.memberPackage
+    const now = new Date()
+
+    if (mp.remainSlots <= 0) {
+      await prisma.waitlist.update({ where: { id: w.id }, data: { status: 'invalid' } })
+      continue
+    }
+    if (mp.expireAt && mp.expireAt < schedule.date) {
+      await prisma.waitlist.update({ where: { id: w.id }, data: { status: 'invalid' } })
+      continue
+    }
+    if (mp.expireAt && mp.expireAt < now) {
+      await prisma.waitlist.update({ where: { id: w.id }, data: { status: 'invalid' } })
+      continue
+    }
+
+    const conflict = await prisma.booking.findFirst({
+      where: {
+        memberId: w.memberId,
+        status: { in: ['booked', 'checked_in'] },
+        schedule: { date: schedule.date, startAt: schedule.startAt },
+      },
+    })
+    if (conflict) {
+      await prisma.waitlist.update({ where: { id: w.id }, data: { status: 'invalid' } })
+      continue
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      const updatedMp = await tx.memberPackage.update({
+        where: { id: mp.id },
+        data: { remainSlots: { decrement: 1 } },
+      })
+      if (updatedMp.remainSlots < 0) throw new Error('课时余量不足')
+
+      await tx.schedule.update({ where: { id: scheduleId }, data: { isBooked: true } })
+
+      const booking = await tx.booking.create({
+        data: {
+          memberId: w.memberId,
+          trainerId: schedule.trainerId,
+          storeId: schedule.storeId,
+          scheduleId,
+          memberPackageId: mp.id,
+          status: 'booked',
+        },
+      })
+
+      await tx.waitlist.update({ where: { id: w.id }, data: { status: 'promoted' } })
+
+      const rest = await tx.waitlist.findMany({
+        where: { scheduleId, status: 'waiting', priority: { gt: w.priority } },
+        orderBy: { priority: 'asc' },
+      })
+      for (const r of rest) {
+        await tx.waitlist.update({ where: { id: r.id }, data: { priority: { decrement: 1 } } })
+      }
+
+      return booking
+    })
+
+    await prisma.notification.create({
+      data: {
+        memberId: w.memberId,
+        type: 'waitlist_promoted',
+        title: '候补成功',
+        content: `您候补的 ${schedule.startAt}-${schedule.endAt} 课程已补位成功，请按时到店`,
+      },
+    })
+
+    return { memberId: w.memberId, bookingId: result.id }
+  }
+
+  return null
+}
+
+router.post('/batch/noshow', async (req: Request, res: Response) => {
+  const { bookingIds, reason } = req.body as { bookingIds: number[]; reason?: string }
+  if (!Array.isArray(bookingIds) || bookingIds.length === 0)
+    return res.status(400).json({ error: 'bookingIds 为必填数组' })
+
+  let successCount = 0
+  const failed: { id: number; error: string }[] = []
+
+  for (const id of bookingIds) {
+    try {
+      const booking = await prisma.booking.findUnique({ where: { id } })
+      if (!booking) {
+        failed.push({ id, error: '预约不存在' })
+        continue
+      }
+      if (booking.status !== 'booked') {
+        failed.push({ id, error: '仅已预约状态可标记爽约' })
+        continue
+      }
+
+      await prisma.$transaction(async (tx) => {
+        await tx.booking.update({ where: { id }, data: { status: 'no_show' } })
+        await tx.noShow.create({
+          data: { bookingId: id, memberId: booking.memberId, reason: reason || null },
+        })
+      })
+
+      await prisma.notification.create({
+        data: {
+          memberId: booking.memberId,
+          type: 'no_show',
+          title: '爽约提醒',
+          content: '您有一节课未按时到店，课时不予返还',
+        },
+      })
+
+      successCount++
+    } catch (e: any) {
+      failed.push({ id, error: e.message || '处理失败' })
+    }
+  }
+
+  res.json({ data: { successCount, failed, total: bookingIds.length } })
+})
+
+router.post('/batch/remind', async (req: Request, res: Response) => {
+  const { bookingIds } = req.body as { bookingIds: number[] }
+  if (!Array.isArray(bookingIds) || bookingIds.length === 0)
+    return res.status(400).json({ error: 'bookingIds 为必填数组' })
+
+  let successCount = 0
+  const failed: { id: number; error: string }[] = []
+
+  for (const id of bookingIds) {
+    try {
+      const booking = await prisma.booking.findUnique({
+        where: { id },
+        include: { schedule: true, trainer: true },
+      })
+      if (!booking) {
+        failed.push({ id, error: '预约不存在' })
+        continue
+      }
+      if (booking.status !== 'booked') {
+        failed.push({ id, error: '仅已预约状态可补发提醒' })
+        continue
+      }
+
+      await prisma.notification.create({
+        data: {
+          memberId: booking.memberId,
+          type: 'booking_reminder',
+          title: '课程提醒',
+          content: `提醒：您今日 ${booking.schedule.startAt} 有 ${booking.trainer.name} 教练的课程，请准时到店`,
+        },
+      })
+
+      successCount++
+    } catch (e: any) {
+      failed.push({ id, error: e.message || '处理失败' })
+    }
+  }
+
+  res.json({ data: { successCount, failed, total: bookingIds.length } })
 })
 
 export default router

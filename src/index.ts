@@ -9,6 +9,8 @@ import bookingRoutes from './routes/booking'
 import feedbackRoutes from './routes/feedback'
 import notificationRoutes from './routes/notification'
 import statsRoutes from './routes/stats'
+import followUpRoutes from './routes/followUp'
+import waitlistRoutes from './routes/waitlist'
 
 const app = express()
 const PORT = process.env.PORT || 3000
@@ -28,6 +30,8 @@ app.use('/api/bookings', bookingRoutes)
 app.use('/api/feedbacks', feedbackRoutes)
 app.use('/api/notifications', notificationRoutes)
 app.use('/api/stats', statsRoutes)
+app.use('/api/follow-ups', followUpRoutes)
+app.use('/api/waitlist', waitlistRoutes)
 
 app.use(errorHandler)
 

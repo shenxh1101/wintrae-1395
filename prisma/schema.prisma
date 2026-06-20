@@ -34,6 +34,8 @@ model Member {
   noShows       NoShow[]
   feedbacks     Feedback[]
   notifications Notification[]
+  followUps     MemberFollowUp[]
+  waitlists     Waitlist[]
 }
 
 model Trainer {
@@ -72,6 +74,7 @@ model MemberPackage {
   member   Member        @relation(fields: [memberId], references: [id])
   package  CoursePackage @relation(fields: [packageId], references: [id])
   bookings Booking[]
+  waitlists Waitlist[]
 }
 
 model Schedule {
@@ -86,7 +89,8 @@ model Schedule {
 
   trainer Trainer @relation(fields: [trainerId], references: [id])
   store   Store   @relation(fields: [storeId], references: [id])
-  booking Booking?
+  bookings Booking[]
+  waitlists Waitlist[]
 }
 
 model Booking {
@@ -94,7 +98,7 @@ model Booking {
   memberId        Int
   trainerId       Int
   storeId         Int
-  scheduleId      Int      @unique
+  scheduleId      Int
   memberPackageId Int
   status          String   @default("booked")
   checkedInAt     DateTime?
@@ -147,4 +151,33 @@ model Notification {
   createdAt DateTime @default(now())
 
   member Member @relation(fields: [memberId], references: [id])
+}
+
+model MemberFollowUp {
+  id            Int      @id @default(autoincrement())
+  memberId      Int
+  followType    String
+  status        String   @default("pending")
+  handler       String?
+  remark        String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  member Member @relation(fields: [memberId], references: [id])
+}
+
+model Waitlist {
+  id              Int      @id @default(autoincrement())
+  memberId        Int
+  scheduleId      Int
+  memberPackageId Int
+  priority        Int      @default(0)
+  status          String   @default("waiting")
+  createdAt       DateTime @default(now())
+
+  member        Member        @relation(fields: [memberId], references: [id])
+  schedule      Schedule      @relation(fields: [scheduleId], references: [id])
+  memberPackage MemberPackage @relation(fields: [memberPackageId], references: [id])
+
+  @@unique([memberId, scheduleId])
 }

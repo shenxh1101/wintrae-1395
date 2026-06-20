@@ -47,11 +47,16 @@ router.get('/trainer/:trainerId', async (req: Request, res: Response) => {
 
   const schedules = await prisma.schedule.findMany({
     where,
-    include: { booking: { include: { member: true } } },
+    include: { bookings: { where: { status: { in: ['booked', 'checked_in', 'completed'] } }, include: { member: true } } },
     orderBy: [{ date: 'asc' }, { startAt: 'asc' }],
   })
 
-  res.json({ data: schedules })
+  const result = schedules.map(s => ({
+    ...s,
+    booking: s.bookings[0] || null,
+  }))
+
+  res.json({ data: result })
 })
 
 router.get('/trainer/:trainerId/daily', async (req: Request, res: Response) => {
@@ -120,6 +125,96 @@ router.get('/trainer/:trainerId/daily', async (req: Request, res: Response) => {
         attendanceRate: total > 0 ? Math.round(((completed) / total) * 100) : 0,
       },
       groupedBookings: grouped,
+    },
+  })
+})
+
+router.get('/trainer/:trainerId/weekly', async (req: Request, res: Response) => {
+  const trainerId = Number(req.params.trainerId)
+  const { weekStart } = req.query as Record<string, string>
+
+  const baseDate = weekStart ? dayjs(weekStart) : dayjs()
+  const start = baseDate.startOf('week')
+  const end = baseDate.endOf('week')
+
+  const trainer = await prisma.trainer.findUnique({ where: { id: trainerId } })
+  if (!trainer) return res.status(404).json({ error: '教练不存在' })
+
+  const bookings = await prisma.booking.findMany({
+    where: {
+      trainerId,
+      schedule: { date: { gte: start.toDate(), lte: end.toDate() } },
+    },
+    include: { member: true, store: true, schedule: true, feedback: true },
+    orderBy: [{ schedule: { date: 'asc' } }, { schedule: { startAt: 'asc' } }],
+  })
+
+  const days: Record<string, any> = {}
+  for (let i = 0; i < 7; i++) {
+    const d = start.add(i, 'day')
+    const key = d.format('YYYY-MM-DD')
+    days[key] = {
+      date: key,
+      dayOfWeek: d.day(),
+      bookings: [],
+      stats: { total: 0, booked: 0, checked_in: 0, completed: 0, no_show: 0, cancelled: 0 },
+    }
+  }
+
+  for (const b of bookings) {
+    const dateKey = dayjs(b.schedule.date).format('YYYY-MM-DD')
+    if (!days[dateKey]) continue
+    days[dateKey].bookings.push({
+      bookingId: b.id,
+      memberId: b.memberId,
+      memberName: b.member.name,
+      startAt: b.schedule.startAt,
+      endAt: b.schedule.endAt,
+      status: b.status,
+      storeName: b.store.name,
+      hasFeedback: !!b.feedback,
+    })
+    days[dateKey].stats.total++
+    if (days[dateKey].stats[b.status] !== undefined) {
+      days[dateKey].stats[b.status]++
+    }
+  }
+
+  const totalBookings = bookings.length
+  const completedCount = bookings.filter(b => b.status === 'completed').length
+  const checkedInCount = bookings.filter(b => b.status === 'checked_in').length
+  const cancelledCount = bookings.filter(b => b.status === 'cancelled').length
+  const noShowCount = bookings.filter(b => b.status === 'no_show').length
+
+  const feedbacks = bookings.filter(b => b.feedback)
+  const avgRating = feedbacks.length
+    ? feedbacks.reduce((s, b) => s + (b.feedback?.rating || 0), 0) / feedbacks.length
+    : 0
+
+  const todayKey = dayjs().format('YYYY-MM-DD')
+  const todayBookings = days[todayKey]?.bookings || []
+  const pendingToday = todayBookings.filter((b: any) => b.status === 'booked')
+
+  res.json({
+    data: {
+      weekStart: start.format('YYYY-MM-DD'),
+      weekEnd: end.format('YYYY-MM-DD'),
+      trainer: { id: trainer.id, name: trainer.name, specialties: trainer.specialties },
+      summary: {
+        totalBookings,
+        completedCount,
+        checkedInCount,
+        cancelledCount,
+        noShowCount,
+        attendanceRate: totalBookings > 0
+          ? Math.round(((completedCount + checkedInCount + bookings.filter(b => b.status === 'booked').length) / totalBookings) * 100)
+          : 0,
+        completionRate: totalBookings > 0 ? Math.round((completedCount / totalBookings) * 100) : 0,
+        feedbackCount: feedbacks.length,
+        avgRating: Math.round(avgRating * 10) / 10,
+        pendingTodayCount: pendingToday.length,
+      },
+      daily: Object.values(days),
     },
   })
 })
