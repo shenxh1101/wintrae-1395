@@ -296,7 +296,7 @@ router.get('/anomaly-dashboard', async (req: Request, res: Response) => {
       include: { member: true, schedule: true, noShow: true },
     })
 
-    const pendingUnconfirmed = await prisma.booking.findMany({
+    const pendingInRange = await prisma.booking.findMany({
       where: {
         storeId: store.id,
         status: 'booked',
@@ -347,25 +347,29 @@ router.get('/anomaly-dashboard', async (req: Request, res: Response) => {
         })),
       }))
 
-    const unconfirmedList = pendingUnconfirmed
-      .map(b => {
-        const startDateTime = dayjs(b.schedule.date).hour(Number(b.schedule.startAt.split(':')[0]))
-        const hoursUntilStart = Math.round(startDateTime.diff(now, 'minute') / 60 * 10) / 10
-        const isUrgent = hoursUntilStart <= urgentLimitHours && hoursUntilStart >= -24
-        return {
-          bookingId: b.id,
-          memberId: b.memberId,
-          memberName: b.member.name,
-          memberPhone: b.member.phone,
-          date: b.schedule.date,
-          startAt: b.schedule.startAt,
-          hoursUntilStart,
-          isUrgent,
-          urgency: hoursUntilStart <= 1 ? 'critical' : hoursUntilStart <= 4 ? 'high' : hoursUntilStart <= urgentLimitHours ? 'medium' : 'normal',
-          status: hoursUntilStart < 0 ? 'overdue' : 'upcoming',
-        }
-      })
+    const rawMapped = pendingInRange.map(b => {
+      const startDateTime = dayjs(b.schedule.date).hour(Number(b.schedule.startAt.split(':')[0]))
+      const hoursUntilStart = Math.round(startDateTime.diff(now, 'minute') / 60 * 10) / 10
+      const isUrgent = hoursUntilStart <= urgentLimitHours && hoursUntilStart >= -24
+      return {
+        bookingId: b.id,
+        memberId: b.memberId,
+        memberName: b.member.name,
+        memberPhone: b.member.phone,
+        date: b.schedule.date,
+        startAt: b.schedule.startAt,
+        hoursUntilStart,
+        isUrgent,
+        urgency: hoursUntilStart <= 1 ? 'critical' : hoursUntilStart <= 4 ? 'high' : hoursUntilStart <= urgentLimitHours ? 'medium' : 'normal',
+        status: hoursUntilStart < 0 ? 'overdue' : 'upcoming',
+      }
+    })
+
+    const unconfirmedList = rawMapped
+      .filter(u => u.isUrgent)
       .sort((a, b) => a.hoursUntilStart - b.hoursUntilStart)
+
+    const nonUrgentFutureCount = rawMapped.filter(u => !u.isUrgent && u.hoursUntilStart > 0).length
 
     result.byStore[store.id] = {
       storeId: store.id,
@@ -377,8 +381,10 @@ router.get('/anomaly-dashboard', async (req: Request, res: Response) => {
         totalCancelled: cancelledBookings.length,
         totalNoShows: noShowBookings.length,
         totalPendingUnconfirmed: unconfirmedList.length,
-        urgentUnconfirmed: unconfirmedList.filter(u => u.isUrgent).length,
+        urgentUnconfirmed: unconfirmedList.length,
         overdueUnconfirmed: unconfirmedList.filter(u => u.status === 'overdue').length,
+        nonUrgentFutureExcluded: nonUrgentFutureCount,
+        checkedInCompletedExcluded: 0,
       },
     }
 
@@ -394,8 +400,12 @@ router.get('/anomaly-dashboard', async (req: Request, res: Response) => {
     totalFrequentCancellers: allFrequentCancellers.length,
     totalFrequentNoShows: allFrequentNoShows.length,
     totalPendingUnconfirmed: allPendingUnconfirmed.length,
-    urgentUnconfirmed: allPendingUnconfirmed.filter(u => u.isUrgent).length,
+    urgentUnconfirmed: allPendingUnconfirmed.length,
     overdueUnconfirmed: allPendingUnconfirmed.filter(u => u.status === 'overdue').length,
+    byStoreTotals: Object.values(result.byStore).reduce((acc: Record<number, number>, s: any) => {
+      acc[s.storeId] = s.counts.totalPendingUnconfirmed
+      return acc
+    }, {}),
     cancelThreshold: cancelLimit,
     noShowThreshold: noShowLimit,
   }

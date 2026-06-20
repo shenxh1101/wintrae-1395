@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express'
 import { prisma } from '../lib/prisma'
+import dayjs from 'dayjs'
 
 const router = Router()
 
@@ -137,7 +138,7 @@ router.put('/:id/cancel', async (req: Request, res: Response) => {
 
   const promoted = await tryPromoteWaitlist(booking.scheduleId)
   if (promoted) {
-    console.log(`预约取消，候补会员 ${promoted.memberId} 自动补位成功，预约ID=${promoted.bookingId}`)
+    console.log(`预约取消，候补会员 ${promoted.memberId} 进入待确认，候补ID=${promoted.waitlistId}`)
   }
 
   res.json({ data: updated, promotedWaitlist: !!promoted })
@@ -260,9 +261,14 @@ router.get('/member/:memberId', async (req: Request, res: Response) => {
   res.json({ data: bookings })
 })
 
-async function tryPromoteWaitlist(scheduleId: number): Promise<{ memberId: number; bookingId: number } | null> {
-  const schedule = await prisma.schedule.findUnique({ where: { id: scheduleId } })
+async function tryPromoteWaitlist(scheduleId: number): Promise<{ memberId: number; waitlistId: number } | null> {
+  const schedule = await prisma.schedule.findUnique({ where: { id: scheduleId }, include: { trainer: true } })
   if (!schedule || schedule.isBooked) return null
+
+  const currentPending = await prisma.waitlist.findFirst({
+    where: { scheduleId, status: 'pending_confirm' },
+  })
+  if (currentPending) return null
 
   const waitingList = await prisma.waitlist.findMany({
     where: { scheduleId, status: 'waiting' },
@@ -270,9 +276,10 @@ async function tryPromoteWaitlist(scheduleId: number): Promise<{ memberId: numbe
     orderBy: { priority: 'asc' },
   })
 
+  const now = new Date()
+
   for (const w of waitingList) {
     const mp = w.memberPackage
-    const now = new Date()
 
     if (mp.remainSlots <= 0) {
       await prisma.waitlist.update({ where: { id: w.id }, data: { status: 'invalid' } })
@@ -299,28 +306,14 @@ async function tryPromoteWaitlist(scheduleId: number): Promise<{ memberId: numbe
       continue
     }
 
-    const result = await prisma.$transaction(async (tx) => {
-      const updatedMp = await tx.memberPackage.update({
-        where: { id: mp.id },
-        data: { remainSlots: { decrement: 1 } },
+    const confirmWindowMinutes = 30
+    const expireAt = dayjs().add(confirmWindowMinutes, 'minute').toDate()
+
+    await prisma.$transaction(async (tx) => {
+      await tx.waitlist.update({
+        where: { id: w.id },
+        data: { status: 'pending_confirm', confirmExpireAt: expireAt, priority: 0 },
       })
-      if (updatedMp.remainSlots < 0) throw new Error('课时余量不足')
-
-      await tx.schedule.update({ where: { id: scheduleId }, data: { isBooked: true } })
-
-      const booking = await tx.booking.create({
-        data: {
-          memberId: w.memberId,
-          trainerId: schedule.trainerId,
-          storeId: schedule.storeId,
-          scheduleId,
-          memberPackageId: mp.id,
-          status: 'booked',
-        },
-      })
-
-      await tx.waitlist.update({ where: { id: w.id }, data: { status: 'promoted' } })
-
       const rest = await tx.waitlist.findMany({
         where: { scheduleId, status: 'waiting', priority: { gt: w.priority } },
         orderBy: { priority: 'asc' },
@@ -328,38 +321,65 @@ async function tryPromoteWaitlist(scheduleId: number): Promise<{ memberId: numbe
       for (const r of rest) {
         await tx.waitlist.update({ where: { id: r.id }, data: { priority: { decrement: 1 } } })
       }
-
-      return booking
     })
 
     await prisma.notification.create({
       data: {
         memberId: w.memberId,
         type: 'waitlist_promoted',
-        title: '候补成功',
-        content: `您候补的 ${schedule.startAt}-${schedule.endAt} 课程已补位成功，请按时到店`,
+        title: '候补待确认',
+        content: `您候补的 ${dayjs(schedule.date).format('MM-DD')} ${schedule.startAt}-${schedule.endAt} ${schedule.trainer.name} 教练课程有名额了！请在 ${confirmWindowMinutes} 分钟内确认，超时将让给其他候补会员`,
       },
     })
 
-    return { memberId: w.memberId, bookingId: result.id }
+    return { memberId: w.memberId, waitlistId: w.id }
   }
 
   return null
 }
 
 router.post('/batch/noshow', async (req: Request, res: Response) => {
-  const { bookingIds, reason } = req.body as { bookingIds: number[]; reason?: string }
+  const { bookingIds, reason, date, trainerId } = req.body as { bookingIds: number[]; reason?: string; date?: string; trainerId?: number }
   if (!Array.isArray(bookingIds) || bookingIds.length === 0)
     return res.status(400).json({ error: 'bookingIds 为必填数组' })
 
+  const targetDate = date ? dayjs(date).startOf('day') : dayjs().startOf('day')
+  const dayStart = targetDate.toDate()
+  const dayEnd = targetDate.endOf('day').toDate()
+
   let successCount = 0
   const failed: { id: number; error: string }[] = []
+  const skipped: { id: number; reason: string }[] = []
 
   for (const id of bookingIds) {
     try {
-      const booking = await prisma.booking.findUnique({ where: { id } })
+      const booking = await prisma.booking.findUnique({
+        where: { id },
+        include: { schedule: true },
+      })
       if (!booking) {
         failed.push({ id, error: '预约不存在' })
+        continue
+      }
+      if (trainerId && booking.trainerId !== Number(trainerId)) {
+        skipped.push({ id, reason: '预约不属于当前教练' })
+        continue
+      }
+      const scheduleDate = dayjs(booking.schedule.date).startOf('day')
+      if (!scheduleDate.isSame(targetDate, 'day')) {
+        skipped.push({ id, reason: `预约日期(${dayjs(booking.schedule.date).format('YYYY-MM-DD')})不在目标日期范围内` })
+        continue
+      }
+      if (booking.status === 'checked_in' || booking.status === 'completed') {
+        skipped.push({ id, reason: `预约已${booking.status === 'checked_in' ? '签到' : '完成'}，不标记爽约` })
+        continue
+      }
+      if (booking.status === 'cancelled') {
+        skipped.push({ id, reason: '预约已取消' })
+        continue
+      }
+      if (booking.status === 'no_show') {
+        skipped.push({ id, reason: '已标记爽约' })
         continue
       }
       if (booking.status !== 'booked') {
@@ -379,7 +399,7 @@ router.post('/batch/noshow', async (req: Request, res: Response) => {
           memberId: booking.memberId,
           type: 'no_show',
           title: '爽约提醒',
-          content: '您有一节课未按时到店，课时不予返还',
+          content: `您 ${dayjs(booking.schedule.date).format('MM-DD')} ${booking.schedule.startAt} 的课程未按时到店，课时不予返还`,
         },
       })
 
@@ -389,16 +409,29 @@ router.post('/batch/noshow', async (req: Request, res: Response) => {
     }
   }
 
-  res.json({ data: { successCount, failed, total: bookingIds.length } })
+  res.json({
+    data: {
+      targetDate: targetDate.format('YYYY-MM-DD'),
+      total: bookingIds.length,
+      successCount,
+      failed,
+      skipped,
+      skippedCount: skipped.length,
+      failedCount: failed.length,
+    },
+  })
 })
 
 router.post('/batch/remind', async (req: Request, res: Response) => {
-  const { bookingIds } = req.body as { bookingIds: number[] }
+  const { bookingIds, date, trainerId } = req.body as { bookingIds: number[]; date?: string; trainerId?: number }
   if (!Array.isArray(bookingIds) || bookingIds.length === 0)
     return res.status(400).json({ error: 'bookingIds 为必填数组' })
 
+  const targetDate = date ? dayjs(date).startOf('day') : dayjs().startOf('day')
+
   let successCount = 0
   const failed: { id: number; error: string }[] = []
+  const skipped: { id: number; reason: string }[] = []
 
   for (const id of bookingIds) {
     try {
@@ -408,6 +441,27 @@ router.post('/batch/remind', async (req: Request, res: Response) => {
       })
       if (!booking) {
         failed.push({ id, error: '预约不存在' })
+        continue
+      }
+      if (trainerId && booking.trainerId !== Number(trainerId)) {
+        skipped.push({ id, reason: '预约不属于当前教练' })
+        continue
+      }
+      const scheduleDate = dayjs(booking.schedule.date).startOf('day')
+      if (!scheduleDate.isSame(targetDate, 'day')) {
+        skipped.push({ id, reason: `预约日期(${dayjs(booking.schedule.date).format('YYYY-MM-DD')})不在目标日期范围内` })
+        continue
+      }
+      if (booking.status === 'checked_in' || booking.status === 'completed') {
+        skipped.push({ id, reason: `预约已${booking.status === 'checked_in' ? '签到' : '完成'}，无需提醒` })
+        continue
+      }
+      if (booking.status === 'cancelled') {
+        skipped.push({ id, reason: '预约已取消' })
+        continue
+      }
+      if (booking.status === 'no_show') {
+        skipped.push({ id, reason: '已标记爽约' })
         continue
       }
       if (booking.status !== 'booked') {
@@ -430,7 +484,17 @@ router.post('/batch/remind', async (req: Request, res: Response) => {
     }
   }
 
-  res.json({ data: { successCount, failed, total: bookingIds.length } })
+  res.json({
+    data: {
+      targetDate: targetDate.format('YYYY-MM-DD'),
+      total: bookingIds.length,
+      successCount,
+      failed,
+      skipped,
+      skippedCount: skipped.length,
+      failedCount: failed.length,
+    },
+  })
 })
 
 export default router

@@ -18,6 +18,7 @@ model Store {
   trainers    Trainer[]
   schedules   Schedule[]
   bookings    Booking[]
+  followUps   MemberFollowUp[]
 }
 
 model Member {
@@ -156,7 +157,9 @@ model Notification {
 model MemberFollowUp {
   id            Int      @id @default(autoincrement())
   memberId      Int
+  storeId       Int?
   followType    String
+  coveredRisks  String?
   status        String   @default("pending")
   handler       String?
   remark        String?
@@ -164,6 +167,7 @@ model MemberFollowUp {
   updatedAt     DateTime @updatedAt
 
   member Member @relation(fields: [memberId], references: [id])
+  store  Store? @relation(fields: [storeId], references: [id])
 }
 
 model Waitlist {
@@ -173,6 +177,7 @@ model Waitlist {
   memberPackageId Int
   priority        Int      @default(0)
   status          String   @default("waiting")
+  confirmExpireAt DateTime?
   createdAt       DateTime @default(now())
 
   member        Member        @relation(fields: [memberId], references: [id])
